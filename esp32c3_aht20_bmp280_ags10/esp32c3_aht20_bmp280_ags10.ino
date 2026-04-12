@@ -32,7 +32,7 @@
 
 // Calibration offsets (add to raw reading)
 #define TEMP_OFFSET         0.0f    // e.g. -1.5 to subtract 1.5°C
-#define HUMIDITY_OFFSET     0.0f    // e.g. +5.0 to add 5%
+#define HUMIDITY_OFFSET     +20.0f    // e.g. +5.0 to add 5%
 
 // HomeKit pairing code (8 digits)
 #define HK_PAIRING_CODE     "46637726"

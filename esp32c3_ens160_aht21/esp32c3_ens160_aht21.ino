@@ -32,6 +32,10 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 
+// ===================== Calibration Offsets ====================
+#define TEMP_OFFSET       0.0f    // e.g. -1.5 to subtract 1.5°C
+#define HUMIDITY_OFFSET   0.0f    // e.g. +5.0 to add 5%
+
 // ===================== Pin Configuration =====================
 #define PIN_SDA     4
 #define PIN_SCL     5
@@ -446,8 +450,8 @@ void readSensors() {
   // AHT21
   float t, h;
   if (aht.read(t, h)) {
-    temperature = t;
-    humidity    = h;
+    temperature = t + TEMP_OFFSET;
+    humidity    = constrain(h + HUMIDITY_OFFSET, 0, 100);
     ahtOk       = true;
     // Feed compensation to ENS160
     if (ensOk) ens.setCompensation(t, h);
