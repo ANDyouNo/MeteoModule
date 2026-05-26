@@ -19,6 +19,10 @@
  *   3 taps      → toggle display on/off
  *   Hold 10 sec → HomeKit factory reset + reboot
  *
+ * The display also turns on/off automatically on a network-time
+ * schedule (SCREEN_SCHEDULE_* in the config block). The button
+ * overrides the schedule until the next scheduled switch point.
+ *
  * WiFi: configured via Serial (HomeSpan CLI, type 'W')
  * Pairing code: 466-37-726
  */
@@ -42,9 +46,27 @@
 #define PIN_SDA             8
 #define PIN_SCL             9
 
+// ── Display schedule (automatic on/off via network NTP clock) ──
+// The button still works at any time and overrides the schedule
+// until the next scheduled switch point.
+// NTP_SERVER1 may be your router's LAN IP (many routers act as an
+// NTP server, e.g. "192.168.1.1") or a public internet pool.
+#define SCREEN_SCHEDULE_ENABLE   true
+#define SCREEN_ON_HOUR           7      // turn display ON  at 07:00
+#define SCREEN_ON_MINUTE         0
+#define SCREEN_OFF_HOUR          23     // turn display OFF at 23:00
+#define SCREEN_OFF_MINUTE        0
+
+#define NTP_SERVER1              "pool.ntp.org"
+#define NTP_SERVER2              "time.nist.gov"
+#define GMT_OFFSET_SEC           0      // UTC offset, seconds (UTC+3 = 10800)
+#define DAYLIGHT_OFFSET_SEC      0      // extra DST offset, seconds
+#define SCHEDULE_CHECK_INTERVAL  15000  // re-evaluate schedule every 15 s
+
 // ── Includes (AFTER config defines so headers see them) ──
 #include <Wire.h>
 #include <HomeSpan.h>
+#include <time.h>
 
 #include "DisplayManager.h"
 #include "SensorManager.h"
@@ -70,6 +92,11 @@ bool          wifiConnected    = false;
 bool          pairingDismissed = false;
 unsigned long lastSensorRead   = 0;
 const unsigned long SENSOR_INTERVAL = 2000;
+
+// Display schedule state
+unsigned long lastScheduleCheck = 0;
+bool          timeSyncStarted   = false;  // true once NTP configTime() issued
+int8_t        lastSchedState    = -1;     // -1 = unknown, 0 = off, 1 = on
 
 // ──────────────────────────────────────────────
 void setup() {
@@ -171,6 +198,47 @@ void refreshDisplay() {
 }
 
 // ──────────────────────────────────────────────
+//  Network time & display schedule
+// ──────────────────────────────────────────────
+
+// Issue the NTP configuration once, as soon as WiFi is up.
+void initTimeSync() {
+    if (timeSyncStarted) return;
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
+    timeSyncStarted = true;
+    Serial.println("[TIME] NTP sync requested.");
+}
+
+// True if the display should be ON for the given local time.
+// Handles a window that wraps past midnight (e.g. 22:00 → 07:00).
+bool scheduleWantsOn(const struct tm &t) {
+    int cur = t.tm_hour * 60 + t.tm_min;
+    int on  = SCREEN_ON_HOUR  * 60 + SCREEN_ON_MINUTE;
+    int off = SCREEN_OFF_HOUR * 60 + SCREEN_OFF_MINUTE;
+    if (on == off) return true;                     // window disabled → always on
+    if (on <  off) return (cur >= on && cur < off); // same-day window
+    return (cur >= on || cur < off);                // window wraps past midnight
+}
+
+// Re-evaluate the schedule. Only acts when a switch point is
+// crossed, so a manual button press stays in effect until the
+// next scheduled on/off transition.
+void applySchedule() {
+    struct tm t;
+    if (!getLocalTime(&t, 50)) return;              // time not synced yet
+
+    bool wantOn = scheduleWantsOn(t);
+    if ((int8_t)wantOn == lastSchedState) return;   // no switch point crossed
+
+    lastSchedState = wantOn;
+    displayOn      = wantOn;
+    refreshDisplay();                               // draws screen or turns off
+
+    Serial.printf("[SCHEDULE] %02d:%02d -> display %s\n",
+                  t.tm_hour, t.tm_min, displayOn ? "ON" : "OFF");
+}
+
+// ──────────────────────────────────────────────
 void loop() {
     homeSpan.poll();
 
@@ -180,8 +248,17 @@ void loop() {
     bool wf = WiFi.status() == WL_CONNECTED;
     if (wf != wifiConnected) {
         wifiConnected = wf;
+        if (wifiConnected) initTimeSync();   // start NTP once online
         if (currentScreen == SCR_PAIRING) refreshDisplay();
     }
+
+    #if SCREEN_SCHEDULE_ENABLE
+    // Time-based display on/off (button overrides until next switch point)
+    if (now - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL) {
+        lastScheduleCheck = now;
+        applySchedule();
+    }
+    #endif
 
     // Sensor reading
     if (now - lastSensorRead >= SENSOR_INTERVAL) {

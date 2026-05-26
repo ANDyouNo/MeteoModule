@@ -1,5 +1,6 @@
 /*
  * MeteoModule — ESP32-C3 Weather Station + Apple HomeKit
+ * v2.2 — ENS160 toggle + NTP-scheduled display on/off
  *
  * Hardware:
  *   - ESP32-C3
@@ -14,27 +15,63 @@
  *
  * Controls:
  *   Single press  — cycle screens (Pairing → Main ↔ Air)
- *   Triple press   — toggle display off / on
+ *   Triple press  — toggle display off / on
  *
- * HomeKit services exposed:
+ * The display also turns on/off automatically on a network-time
+ * schedule (SCREEN_SCHEDULE_* below). The button overrides the
+ * schedule until the next scheduled switch point.
+ *
+ * Build options (config block below the includes):
+ *   ENABLE_ENS160          — false = AHT21-only build
+ *   SCREEN_SCHEDULE_ENABLE — false = no time-based on/off
+ *
+ * HomeKit services:
  *   TemperatureSensor, HumiditySensor,
  *   AirQualitySensor (VOCDensity), CarbonDioxideSensor (eCO2)
+ *     — Air Quality + CO2 only built when ENABLE_ENS160 = true
  *
- * WiFi is configured via Serial (HomeSpan CLI: type 'W').
+ * WiFi: configured via Serial (HomeSpan CLI: type 'W')
  * Pairing code: 466-37-726
  *
- * Libraries required (install via Arduino Library Manager):
- *   - HomeSpan            (by Gregg Berman)
- *   - U8g2                (by oliver / olikraus)
+ * Libraries (Arduino Library Manager):
+ *   - HomeSpan  (by Gregg Berman)
+ *   - U8g2     (by olikraus)
  */
 
 #include "HomeSpan.h"
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <time.h>
 
 // ===================== Calibration Offsets ====================
-#define TEMP_OFFSET       0.0f    // e.g. -1.5 to subtract 1.5°C
-#define HUMIDITY_OFFSET   0.0f    // e.g. +5.0 to add 5%
+#define TEMP_OFFSET       -0.75f    // compensate ENS160 board heat
+#define HUMIDITY_OFFSET    0.0f    // e.g. +5.0 to add 5%
+
+// ===================== Feature Toggles =======================
+// Build an AHT21-only firmware by setting this to false. When
+// disabled, the ENS160 is never initialised, the Air screen is
+// hidden, and the HomeKit Air Quality / CO2 accessories are not
+// created. (Mirrors ENABLE_AGS10 in the AGS10 firmware.)
+#define ENABLE_ENS160        true
+
+// ===================== Display Schedule ======================
+// Automatic display on/off driven by a network clock (NTP).
+// The button still works at any time and acts as a manual
+// override until the next scheduled switch point.
+//
+// NTP_SERVER1 can be your router's LAN IP — many routers act as
+// an NTP server (e.g. "192.168.1.1") — or a public internet pool.
+#define SCREEN_SCHEDULE_ENABLE   true
+#define SCREEN_ON_HOUR           7      // turn display ON  at 07:00
+#define SCREEN_ON_MINUTE         0
+#define SCREEN_OFF_HOUR          23     // turn display OFF at 23:00
+#define SCREEN_OFF_MINUTE        0
+
+#define NTP_SERVER1              "pool.ntp.org"
+#define NTP_SERVER2              "time.nist.gov"
+#define GMT_OFFSET_SEC           0      // UTC offset, seconds (UTC+3 = 10800)
+#define DAYLIGHT_OFFSET_SEC      0      // extra DST offset, seconds
+#define SCHEDULE_CHECK_INTERVAL  15000  // re-evaluate schedule every 15 s
 
 // ===================== Pin Configuration =====================
 #define PIN_SDA     4
@@ -43,15 +80,15 @@
 
 // ===================== I2C Addresses =========================
 #define AHT21_ADDR   0x38
-#define ENS160_ADDR  0x53   // ADD pin LOW; use 0x52 if ADD→HIGH
+#define ENS160_ADDR  0x53
 
 // ===================== Timing (ms) ===========================
 #define SENSOR_INTERVAL     2000
-#define DISPLAY_INTERVAL    300
+#define DISPLAY_INTERVAL    500
 #define HOMEKIT_INTERVAL    10000
 #define DEBOUNCE_MS         50
-#define CLICK_GAP_MS        400     // max gap between clicks for multi-click
-#define ENS160_WARMUP_MS    180000  // 3 min initial warm-up
+#define CLICK_GAP_MS        400
+#define ENS_LOG_INTERVAL    60000   // diagnostic log every 60s
 
 // ===================== Screen States =========================
 enum Screen { SCR_PAIRING, SCR_MAIN, SCR_AIR };
@@ -61,8 +98,8 @@ struct Widget {
   int x, y, w, h;
 };
 
-const Widget WIDGET_L = { 3,  3, 58, 58 };
-const Widget WIDGET_R = { 67, 3, 58, 58 };
+static const Widget WIDGET_L = { 3,  3, 58, 58 };
+static const Widget WIDGET_R = { 67, 3, 58, 58 };
 
 // ===================== OLED ==================================
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
@@ -76,18 +113,23 @@ bool     wifiConnected  = false;
 float    temperature    = 0.0f;
 float    humidity       = 0.0f;
 uint16_t tvoc           = 0;
-uint16_t eco2           = 400;
-uint8_t  aqiIndex       = 0;       // ENS160 AQI 1-5
+uint16_t eco2           = 0;
+uint8_t  aqiIndex       = 0;
 bool     ahtOk          = false;
 bool     ensOk          = false;
-bool     ensWarming     = true;
+bool     ensWarming     = true;    // true until first valid data from ENS160
+bool     ensEverReady   = false;   // logged once when sensor produces first data
 
 // Timing
-uint32_t lastSensorRead   = 0;
-uint32_t lastDisplayDraw  = 0;
-uint32_t lastHKUpdate     = 0;
-uint32_t ensStartTime     = 0;
-bool     needRedraw       = true;
+uint32_t lastSensorRead    = 0;
+uint32_t lastDisplayDraw   = 0;
+uint32_t lastEnsLog        = 0;
+uint32_t lastScheduleCheck = 0;
+bool     needRedraw        = true;
+
+// Display schedule
+bool     timeSyncStarted   = false;  // true once NTP configTime() issued
+int8_t   lastSchedState    = -1;     // -1 = unknown, 0 = off, 1 = on
 
 // Button
 bool     btnPrev          = false;
@@ -95,13 +137,24 @@ uint32_t btnDownTime      = 0;
 uint8_t  clickCount       = 0;
 uint32_t lastClickTime    = 0;
 
-// ===================== HomeKit Characteristic Pointers ========
+// HomeKit characteristic pointers
 SpanCharacteristic *hkTemp       = nullptr;
 SpanCharacteristic *hkHumid      = nullptr;
 SpanCharacteristic *hkAQ         = nullptr;
 SpanCharacteristic *hkVOC        = nullptr;
 SpanCharacteristic *hkCO2Det     = nullptr;
 SpanCharacteristic *hkCO2Level   = nullptr;
+
+// =============================================================
+//  Helper: format uptime as "HHh MMm SSs"
+// =============================================================
+void printUptime() {
+  uint32_t sec = millis() / 1000;
+  uint32_t h = sec / 3600;
+  uint32_t m = (sec % 3600) / 60;
+  uint32_t s = sec % 60;
+  Serial.printf("[%02uh %02um %02us] ", h, m, s);
+}
 
 // =============================================================
 //                     AHT21 Minimal Driver
@@ -111,7 +164,7 @@ class AHT21 {
 public:
   bool begin() {
     Wire.beginTransmission(AHT21_ADDR);
-    Wire.write(0xBE);  // init / calibrate
+    Wire.write(0xBE);
     Wire.write(0x08);
     Wire.write(0x00);
     if (Wire.endTransmission() != 0) return false;
@@ -120,7 +173,6 @@ public:
   }
 
   bool read(float &t, float &h) {
-    // Trigger measurement
     Wire.beginTransmission(AHT21_ADDR);
     Wire.write(0xAC);
     Wire.write(0x33);
@@ -134,7 +186,7 @@ public:
     uint8_t buf[7];
     for (int i = 0; i < 7; i++) buf[i] = Wire.read();
 
-    if (buf[0] & 0x80) return false; // busy
+    if (buf[0] & 0x80) return false;
 
     uint32_t rawH = ((uint32_t)buf[1] << 12) |
                     ((uint32_t)buf[2] << 4)  |
@@ -156,19 +208,59 @@ public:
 class ENS160 {
 public:
   bool begin() {
-    // Read part ID
+    // 1) Hard reset
+    writeReg(0x10, 0xF4);
+    delay(200);
+
+    // 2) Verify part ID
     uint16_t id = readReg16(0x00);
+    Serial.printf("[ENS160] Part ID: 0x%04X\n", id);
     if (id != 0x0160) {
-      Serial.printf("[ENS160] Bad part ID: 0x%04X\n", id);
+      Serial.println("[ENS160] ERROR: unexpected part ID!");
       return false;
     }
-    // Set standard operating mode
-    writeReg(0x10, 0x02);
+
+    // 3) Go to Idle
+    writeReg(0x10, 0x01);
+    delay(100);
+
+    // 4) Read firmware version
+    writeReg(0x12, 0x0E);   // GET_APPVER
+    delay(100);
+    uint8_t fwMaj = readReg8(0x4C);
+    uint8_t fwMin = readReg8(0x4D);
+    uint8_t fwRel = readReg8(0x4E);
+    Serial.printf("[ENS160] Firmware: %u.%u.%u\n", fwMaj, fwMin, fwRel);
+
+    // 5) Clear GPR
+    writeReg(0x12, 0xCC);
+    delay(100);
+    writeReg(0x12, 0x00);   // NOP
+    delay(100);
+
+    // 6) Set default compensation before starting
+    setCompensation(25.0f, 50.0f);
     delay(50);
+
+    // 7) Enter Standard mode
+    writeReg(0x10, 0x02);
+    delay(200);
+
+    // 8) Set compensation again in standard mode
+    setCompensation(25.0f, 50.0f);
+    delay(100);
+
+    // 9) Report initial state
+    uint8_t mode   = readReg8(0x10);
+    uint8_t status = readReg8(0x20);
+    Serial.printf("[ENS160] OPMODE=0x%02X  STATUS=0x%02X\n", mode, status);
+    Serial.printf("[ENS160] STATUS bits: STATAS=%u  ERR=%u  NEWDAT=%u  NEWGPR=%u\n",
+                  status & 0x03, (status >> 2) & 0x01 ? 0 : 0,
+                  (status >> 2) & 0x01, (status >> 3) & 0x01);
+
     return true;
   }
 
-  // Feed temperature (C) and humidity (%) for compensation
   void setCompensation(float t, float h) {
     uint16_t tVal = (uint16_t)((t + 273.15f) * 64.0f);
     uint16_t hVal = (uint16_t)(h * 512.0f);
@@ -176,14 +268,32 @@ public:
     writeReg16(0x15, hVal);
   }
 
+  // Returns true if new data was available and read successfully
   bool readData(uint8_t &aqi, uint16_t &tvocVal, uint16_t &eco2Val) {
     uint8_t status = readReg8(0x20);
-    if (!(status & 0x04)) return false; // no new data
+
+    // Bit 2 = NEWDAT (new data available)
+    if (!(status & 0x04)) return false;
 
     aqi     = readReg8(0x21) & 0x07;
     tvocVal = readReg16(0x22);
     eco2Val = readReg16(0x24);
     return true;
+  }
+
+  // Read STATUS register for diagnostics
+  uint8_t readStatus() {
+    return readReg8(0x20);
+  }
+
+  uint8_t readOpmode() {
+    return readReg8(0x10);
+  }
+
+  // Read current TVOC/eCO2 registers directly (even if NEWDAT not set)
+  void readRawValues(uint16_t &tvocVal, uint16_t &eco2Val) {
+    tvocVal = readReg16(0x22);
+    eco2Val = readReg16(0x24);
   }
 
 private:
@@ -261,8 +371,8 @@ struct SvcAirQuality : Service::AirQualitySensor {
   void loop() override {
     if (hkAQ->timeVal() > HOMEKIT_INTERVAL && ensOk && !ensWarming) {
       hkAQ->setVal(aqiIndex);
-      float vocUgm3 = tvoc * 4.0f;        // rough ppb→ug/m3 conversion
-      if (vocUgm3 > 1000) vocUgm3 = 1000; // HAP cap
+      float vocUgm3 = tvoc * 4.0f;
+      if (vocUgm3 > 1000) vocUgm3 = 1000;
       hkVOC->setVal(vocUgm3);
     }
   }
@@ -285,37 +395,28 @@ struct SvcCO2 : Service::CarbonDioxideSensor {
 //               Icon Drawing Functions (vector)
 // =============================================================
 
-// Thermometer — centre at (cx, cy), fits ~14x14 px
 void drawIconTemp(int cx, int cy) {
-  // Stem
   display.drawRBox(cx - 2, cy - 7, 5, 11, 1);
-  // Bulb
   display.drawDisc(cx, cy + 6, 4);
-  // Inner cut-out (mercury channel)
   display.setDrawColor(0);
   display.drawBox(cx - 1, cy - 5, 3, 9);
   display.drawDisc(cx, cy + 6, 2);
   display.setDrawColor(1);
-  // Mercury fill
   display.drawBox(cx - 1, cy - 1, 3, 5);
   display.drawDisc(cx, cy + 6, 2);
-  // Scale ticks
   display.drawHLine(cx + 3, cy - 4, 2);
   display.drawHLine(cx + 3, cy - 1, 2);
   display.drawHLine(cx + 3, cy + 2, 2);
 }
 
-// Water droplet — centre at (cx, cy)
 void drawIconHumid(int cx, int cy) {
   display.drawDisc(cx, cy + 3, 5);
   display.drawTriangle(cx - 5, cy + 3, cx + 5, cy + 3, cx, cy - 7);
-  // Highlight
   display.setDrawColor(0);
   display.drawDisc(cx - 2, cy + 1, 1);
   display.setDrawColor(1);
 }
 
-// TVOC — three wavy lines (air/vapour)
 void drawIconTVOC(int cx, int cy) {
   for (int row = -4; row <= 4; row += 4) {
     for (int x = -6; x <= 6; x++) {
@@ -326,17 +427,14 @@ void drawIconTVOC(int cx, int cy) {
   }
 }
 
-// CO2 — text label with a small cloud shape
 void drawIconCO2(int cx, int cy) {
-  // Cloud outline
   display.drawDisc(cx - 3, cy - 1, 4);
   display.drawDisc(cx + 3, cy - 1, 3);
   display.drawDisc(cx, cy - 4, 3);
   display.drawBox(cx - 6, cy, 13, 4);
   display.drawRBox(cx - 7, cy + 1, 15, 4, 2);
-  // "CO2" text on cloud
   display.setDrawColor(0);
-  display.setFont(u8g2_font_micro_tr); // tiny 3px font
+  display.setFont(u8g2_font_micro_tr);
   int w = display.getStrWidth("CO2");
   display.drawStr(cx - w / 2, cy + 3, "CO2");
   display.setDrawColor(1);
@@ -345,22 +443,17 @@ void drawIconCO2(int cx, int cy) {
 // =============================================================
 //                    Widget Drawing
 // =============================================================
-// Widget: rounded rect, top half = icon, divider line, bottom half = value
 
 void drawWidget(const Widget &wd, void (*iconFn)(int, int), const char *value) {
-  // Rounded frame
   display.drawRFrame(wd.x, wd.y, wd.w, wd.h, 6);
 
-  // Icon centred in top portion
   int iconCx = wd.x + wd.w / 2;
   int iconCy = wd.y + 15;
   iconFn(iconCx, iconCy);
 
-  // Divider line
   display.drawHLine(wd.x + 4, wd.y + 28, wd.w - 8);
 
-  // Value text centred in bottom portion
-  display.setFont(u8g2_font_helvB10_te);  // 10px bold, extended (has degree sign)
+  display.setFont(u8g2_font_helvB10_te);
   int tw = display.getStrWidth(value);
   int tx = wd.x + (wd.w - tw) / 2;
   int ty = wd.y + 46;
@@ -372,21 +465,21 @@ void drawWidget(const Widget &wd, void (*iconFn)(int, int), const char *value) {
 // =============================================================
 
 void drawScreenMain() {
-  char bufT[12], bufH[12];
+  char bufT[16], bufH[16];
   dtostrf(temperature, 3, 1, bufT);
-  strcat(bufT, "\xB0" "C");            // degree sign + C
-  snprintf(bufH, sizeof(bufH), "%d%%", (int)round(humidity));
+  strcat(bufT, "\xB0" "C");
+  snprintf(bufH, sizeof(bufH), "%d%%", constrain((int)round(humidity), 0, 100));
 
   drawWidget(WIDGET_L, drawIconTemp,  bufT);
   drawWidget(WIDGET_R, drawIconHumid, bufH);
 }
 
 void drawScreenAir() {
-  char bufV[12], bufC[12];
+  char bufV[16], bufC[16];
 
   if (ensWarming) {
-    strcpy(bufV, "---");
-    strcpy(bufC, "---");
+    strcpy(bufV, "wait...");
+    strcpy(bufC, "wait...");
   } else {
     snprintf(bufV, sizeof(bufV), "%u ppb", tvoc);
     snprintf(bufC, sizeof(bufC), "%u ppm", eco2);
@@ -397,25 +490,21 @@ void drawScreenAir() {
 }
 
 void drawScreenPairing() {
-  // Title
   display.setFont(u8g2_font_helvR08_te);
   const char *title = "HomeKit";
   int tw = display.getStrWidth(title);
   display.drawStr(64 - tw / 2, 12, title);
 
-  // Pairing code large
-  display.setFont(u8g2_font_helvB14_tn);  // bold numbers
+  display.setFont(u8g2_font_helvB14_tn);
   const char *code = "466-37-726";
   tw = display.getStrWidth(code);
   display.drawStr(64 - tw / 2, 36, code);
 
-  // WiFi status
   display.setFont(u8g2_font_helvR08_te);
   const char *status = wifiConnected ? "WiFi: OK" : "WiFi: Serial 'W'";
   tw = display.getStrWidth(status);
   display.drawStr(64 - tw / 2, 54, status);
 
-  // Decorative line
   display.drawHLine(20, 16, 88);
 }
 
@@ -447,17 +536,24 @@ void updateDisplay() {
 // =============================================================
 
 void readSensors() {
-  // AHT21
-  float t, h;
-  if (aht.read(t, h)) {
-    temperature = t + TEMP_OFFSET;
-    humidity    = constrain(h + HUMIDITY_OFFSET, 0, 100);
+  // ── AHT21 ──
+  float rawT, rawH;
+  if (aht.read(rawT, rawH)) {
+    // Apply offsets for display & HomeKit
+    temperature = rawT + TEMP_OFFSET;
+    humidity    = constrain(rawH + HUMIDITY_OFFSET, 0.0f, 100.0f);
     ahtOk       = true;
-    // Feed compensation to ENS160
-    if (ensOk) ens.setCompensation(t, h);
+
+    // Feed RAW (un-offset) values to ENS160 for compensation
+    #if ENABLE_ENS160
+    if (ensOk) {
+      ens.setCompensation(rawT, rawH);
+    }
+    #endif
   }
 
-  // ENS160
+  // ── ENS160 ──
+  #if ENABLE_ENS160
   if (ensOk) {
     uint8_t  aqi;
     uint16_t tv, ec;
@@ -465,28 +561,54 @@ void readSensors() {
       aqiIndex = aqi;
       tvoc     = tv;
       eco2     = ec;
-    }
-    // Check warm-up
-    if (ensWarming && (millis() - ensStartTime > ENS160_WARMUP_MS)) {
-      ensWarming = false;
+
+      // First valid data — sensor is out of warm-up!
+      if (ensWarming) {
+        ensWarming  = false;
+        ensEverReady = true;
+        printUptime();
+        Serial.printf("[ENS160] *** WARM-UP COMPLETE *** "
+                      "AQI=%u  TVOC=%u ppb  eCO2=%u ppm\n",
+                      aqi, tv, ec);
+      }
     }
   }
+  #endif
 
   needRedraw = true;
 }
 
 // =============================================================
+//               ENS160 Periodic Diagnostics
+// =============================================================
+
+void logEnsDiagnostics() {
+  if (!ensOk) return;
+
+  uint32_t now = millis();
+  if (now - lastEnsLog < ENS_LOG_INTERVAL) return;
+  lastEnsLog = now;
+
+  uint8_t  status = ens.readStatus();
+  uint8_t  mode   = ens.readOpmode();
+  uint16_t rawTvoc, rawEco2;
+  ens.readRawValues(rawTvoc, rawEco2);
+
+  printUptime();
+  Serial.printf("[ENS160] STATUS=0x%02X  OPMODE=0x%02X  "
+                "TVOC=%u  eCO2=%u  warming=%s\n",
+                status, mode, rawTvoc, rawEco2,
+                ensWarming ? "YES" : "NO");
+}
+
+// =============================================================
 //                      Button Handler
 // =============================================================
-// Touch button: HIGH when pressed.
-// Detects single-click and triple-click via click counting
-// within a time window.
 
 void handleButton() {
   bool pressed = digitalRead(PIN_BUTTON) == HIGH;
   uint32_t now = millis();
 
-  // Rising edge detection with debounce
   if (pressed && !btnPrev && (now - btnDownTime > DEBOUNCE_MS)) {
     btnDownTime = now;
     clickCount++;
@@ -494,32 +616,76 @@ void handleButton() {
   }
   btnPrev = pressed;
 
-  // Evaluate after click gap window expires
   if (clickCount > 0 && (now - lastClickTime > CLICK_GAP_MS)) {
     if (clickCount >= 3) {
-      // ── Triple click: toggle display ──
       displayOn = !displayOn;
-      if (displayOn) {
-        curScreen = SCR_MAIN;
-      }
+      if (displayOn) curScreen = SCR_MAIN;
       needRedraw = true;
     } else if (clickCount == 1) {
-      // ── Single click ──
       if (!displayOn) {
         displayOn  = true;
         curScreen  = SCR_MAIN;
       } else {
         switch (curScreen) {
-          case SCR_PAIRING: curScreen = SCR_MAIN; break;
-          case SCR_MAIN:    curScreen = SCR_AIR;  break;
-          case SCR_AIR:     curScreen = SCR_MAIN; break;
+          case SCR_PAIRING:
+            curScreen = SCR_MAIN;
+            break;
+          case SCR_MAIN:
+            #if ENABLE_ENS160
+            curScreen = SCR_AIR;   // only reachable when ENS160 is built in
+            #endif
+            break;
+          case SCR_AIR:
+            curScreen = SCR_MAIN;
+            break;
         }
       }
       needRedraw = true;
     }
-    // (double-click is ignored / treated as two singles — only last evaluated)
     clickCount = 0;
   }
+}
+
+// =============================================================
+//                  Network Time & Schedule
+// =============================================================
+
+// Issue the NTP configuration once, as soon as WiFi is up.
+void initTimeSync() {
+  if (timeSyncStarted) return;
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
+  timeSyncStarted = true;
+  Serial.println("[TIME] NTP sync requested.");
+}
+
+// True if the display should be ON for the given local time.
+// Handles a window that wraps past midnight (e.g. 22:00 → 07:00).
+bool scheduleWantsOn(const struct tm &t) {
+  int cur = t.tm_hour * 60 + t.tm_min;
+  int on  = SCREEN_ON_HOUR  * 60 + SCREEN_ON_MINUTE;
+  int off = SCREEN_OFF_HOUR * 60 + SCREEN_OFF_MINUTE;
+  if (on == off) return true;                     // window disabled → always on
+  if (on <  off) return (cur >= on && cur < off); // same-day window
+  return (cur >= on || cur < off);                // window wraps past midnight
+}
+
+// Re-evaluate the schedule. Only acts when a switch point is
+// crossed, so a manual button press stays in effect until the
+// next scheduled on/off transition.
+void applySchedule() {
+  struct tm t;
+  if (!getLocalTime(&t, 50)) return;              // time not synced yet
+
+  bool wantOn = scheduleWantsOn(t);
+  if ((int8_t)wantOn == lastSchedState) return;   // no switch point crossed
+
+  lastSchedState = wantOn;
+  displayOn      = wantOn;
+  needRedraw     = true;
+
+  printUptime();
+  Serial.printf("[SCHEDULE] %02d:%02d -> display %s\n",
+                t.tm_hour, t.tm_min, displayOn ? "ON" : "OFF");
 }
 
 // =============================================================
@@ -528,21 +694,22 @@ void handleButton() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n[MeteoModule] Starting...");
+  delay(300);
+  Serial.println("\n========================================");
+  Serial.println("  MeteoModule v2.1 — 48h conditioning");
+  Serial.println("========================================");
 
-  // Button
   pinMode(PIN_BUTTON, INPUT);
 
-  // I2C
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000);  // 100 kHz — safe for all devices
+  Wire.setClock(100000);
 
   // OLED
   display.begin();
   display.setContrast(180);
   display.clearBuffer();
   display.setFont(u8g2_font_helvR08_te);
-  display.drawStr(20, 35, "MeteoModule v1.0");
+  display.drawStr(14, 35, "MeteoModule v2.1");
   display.sendBuffer();
 
   // AHT21
@@ -550,57 +717,64 @@ void setup() {
   Serial.printf("[AHT21]  %s\n", ahtOk ? "OK" : "FAIL");
 
   // ENS160
+  #if ENABLE_ENS160
   ensOk = ens.begin();
-  ensStartTime = millis();
-  Serial.printf("[ENS160] %s\n", ensOk ? "OK (warming up 3 min)" : "FAIL");
+  Serial.printf("[ENS160] %s\n", ensOk ? "OK — waiting for warm-up exit..." : "FAIL");
+  if (ensOk) {
+    Serial.println("[ENS160] Will log status every 60s.");
+    Serial.println("[ENS160] Look for '*** WARM-UP COMPLETE ***' message.");
+  }
+  #else
+  Serial.println("[ENS160] disabled (ENABLE_ENS160 = false)");
+  #endif
 
   delay(500);
 
-  // ── HomeSpan ──
+  // HomeSpan
   homeSpan.setLogLevel(1);
   homeSpan.setPairingCode("46637726");
   homeSpan.setQRID("MTEO");
+
   homeSpan.begin(Category::Bridges, "MeteoModule");
 
-  // Bridge accessory (required first)
   new SpanAccessory();
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name("MeteoModule Bridge");
 
-  // Temperature
   new SpanAccessory();
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name("Temperature");
     new SvcTemperature();
 
-  // Humidity
   new SpanAccessory();
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name("Humidity");
     new SvcHumidity();
 
-  // Air Quality (TVOC)
+  #if ENABLE_ENS160
   new SpanAccessory();
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name("Air Quality");
     new SvcAirQuality();
 
-  // CO2
   new SpanAccessory();
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name("CO2 Sensor");
     new SvcCO2();
+  #endif
 
   Serial.println("[HomeSpan] Ready. Type 'W' in Serial to configure WiFi.");
   Serial.println("[HomeSpan] Pairing code: 466-37-726");
 
   curScreen = SCR_PAIRING;
   needRedraw = true;
+
+  Serial.println("\n[READY] 48h test started. Do NOT power off.\n");
 }
 
 // =============================================================
@@ -608,28 +782,41 @@ void setup() {
 // =============================================================
 
 void loop() {
-  // HomeSpan processing (WiFi, HAP, serial CLI)
   homeSpan.poll();
 
   uint32_t now = millis();
 
-  // Track WiFi state
+  // WiFi state tracking
   bool wf = WiFi.status() == WL_CONNECTED;
   if (wf != wifiConnected) {
     wifiConnected = wf;
     needRedraw = true;
+    if (wifiConnected) initTimeSync();   // start NTP once online
   }
 
-  // Read sensors periodically
+  // Read sensors every 2s
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     lastSensorRead = now;
     readSensors();
   }
 
+  #if ENABLE_ENS160
+  // ENS160 diagnostics every 60s
+  logEnsDiagnostics();
+  #endif
+
+  #if SCREEN_SCHEDULE_ENABLE
+  // Time-based display on/off (button overrides until next switch point)
+  if (now - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL) {
+    lastScheduleCheck = now;
+    applySchedule();
+  }
+  #endif
+
   // Button
   handleButton();
 
-  // Refresh display when needed or periodically
+  // Display refresh
   if (needRedraw || (now - lastDisplayDraw >= DISPLAY_INTERVAL)) {
     lastDisplayDraw = now;
     updateDisplay();
