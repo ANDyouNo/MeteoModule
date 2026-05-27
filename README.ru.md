@@ -18,7 +18,7 @@
 | **Экраны** | Темп+Влажность, Давление(+TVOC), Паринг | Темп+Влажность, Воздух (TVOC+eCO₂), Паринг |
 | **Кнопка** | Touch GPIO4 | GPIO3 |
 | **I2C** | SDA=GPIO8, SCL=GPIO9 | SDA=GPIO4, SCL=GPIO5 |
-| **3D-модель корпуса** | [MakerWorld — MeteoModule v1](#) | [MakerWorld — MeteoModule v2](#) |
+| **3D-модель корпуса** | [MakerWorld — MeteoModule v1](https://makerworld.com/ru/models/2853988-meteomodule-v1#profileId-3183823) | [MakerWorld — MeteoModule v2](https://makerworld.com/ru/models/2854021-meteo-module-v2#profileId-3183860) |
 
 ---
 

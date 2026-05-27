@@ -18,7 +18,7 @@ Two firmware variants for a DIY home weather station based on the ESP32-C3, with
 | **Screens** | Temp+Humidity, Pressure(+TVOC), Pairing | Temp+Humidity, Air (TVOC+eCO₂), Pairing |
 | **Button** | Touch GPIO4 | GPIO3 |
 | **I2C** | SDA=GPIO8, SCL=GPIO9 | SDA=GPIO4, SCL=GPIO5 |
-| **3D-printed enclosure** | [MakerWorld — MeteoModule v1](#) | [MakerWorld — MeteoModule v2](#) |
+| **3D-printed enclosure** | [MakerWorld — MeteoModule v1](https://makerworld.com/ru/models/2853988-meteomodule-v1#profileId-3183823) | [MakerWorld — MeteoModule v2](https://makerworld.com/ru/models/2854021-meteo-module-v2#profileId-3183860) |
 
 ---
 
